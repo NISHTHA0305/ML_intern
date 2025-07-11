@@ -1,0 +1,169 @@
+import os
+import tempfile
+import streamlit as st
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+from ollama import Client
+import hashlib
+import json
+
+# --- Setup ---
+EMBEDDING_DIR = "saved_embeddings"
+os.makedirs(EMBEDDING_DIR, exist_ok=True)
+
+# Ollama setup — running locally
+model_ol = Client(host="127.0.0.1:11434")
+model_name = "llama3"
+ # make sure you have pulled this model: `ollama pull llama3`
+
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+dimension = embedder.get_sentence_embedding_dimension()
+print(f"Embedder dimension: {dimension}")
+
+faiss_index = faiss.IndexFlatL2(dimension)
+chunk_text_map = []
+
+
+# --- Helper Functions ---
+def get_file_hash(filename):
+    return hashlib.md5(filename.encode()).hexdigest()
+
+
+def save_embeddings_and_chunks(file_id, embeddings, chunks):
+    np.save(os.path.join(EMBEDDING_DIR, f"{file_id}_embeddings.npy"), embeddings)
+    with open(os.path.join(EMBEDDING_DIR, f"{file_id}_chunks.json"), 'w') as f:
+        json.dump(chunks, f)
+
+
+def load_saved_embeddings_and_chunks():
+    for fname in os.listdir(EMBEDDING_DIR):
+        if fname.endswith("_embeddings.npy"):
+            file_id = fname.replace("_embeddings.npy", "")
+            embeddings = np.load(os.path.join(EMBEDDING_DIR, fname))
+            with open(os.path.join(EMBEDDING_DIR, f"{file_id}_chunks.json")) as f:
+                chunks = json.load(f)
+            faiss_index.add(embeddings.astype("float32"))
+            chunk_text_map.extend(chunks)
+
+
+def extract_text_from_pdf(file_path):
+    text = ''
+    with open(file_path, 'rb') as f:
+        reader = PdfReader(f)
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text and page_text.strip():
+                text += page_text
+    return text
+
+
+def load_and_process_pdfs(uploaded_files):
+    extracted_data = []
+    for uploaded_file in uploaded_files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.read())
+            tmp_file_path = tmp_file.name
+        try:
+            text = extract_text_from_pdf(tmp_file_path)
+            extracted_data.append((uploaded_file.name, text))
+        finally:
+            os.remove(tmp_file_path)
+    return extracted_data
+
+
+def chunk_text(text, chunk_size=500):
+    words = text.split()
+    return [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
+
+def search_faiss_top_chunks(question, top_k=2):
+    question_embedding = embedder.encode([question])
+    question_embedding = np.array(question_embedding).astype("float32")
+    distances, indices = faiss_index.search(question_embedding, k=top_k)
+    return [chunk_text_map[idx] for idx in indices[0]]
+
+
+def answer_with_ollama_chunks(chunks, question):
+    context = "\n\n---\n\n".join(chunks)
+    prompt = f"""Based on the following excerpts from a PDF, please provide a concise answer to the question.
+
+Relevant Chunks:
+{context}
+
+Question: {question}
+Answer:"""
+
+    response = model_ol.chat(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    raw_answer = response['message']['content'].strip()
+
+    # Remove any <think> ... </think> parts if present
+    if "<think>" in raw_answer:
+        try:
+            start = raw_answer.index("<think>")
+            end = raw_answer.index("</think>") + len("</think>")
+            raw_answer = raw_answer.replace(raw_answer[start:end], "").strip()
+        except:
+            pass  # if malformed, just skip
+
+    return raw_answer
+
+
+# --- Load cached data ---
+load_saved_embeddings_and_chunks()
+
+
+# --- Streamlit UI ---
+st.title("📄 PDF Question Answering with Local AI (Ollama + FAISS)")
+
+uploaded_files = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
+
+if uploaded_files:
+    extracted_data = load_and_process_pdfs(uploaded_files)
+
+    for filename, text in extracted_data:
+        st.subheader(f"📘 Extracted from {filename}")
+        st.text_area("Text", value=text, height=300)
+
+        file_id = get_file_hash(filename)
+        embeddings_path = os.path.join(EMBEDDING_DIR, f"{file_id}_embeddings.npy")
+
+        if not os.path.exists(embeddings_path):
+            chunks = chunk_text(text)
+            embeddings = embedder.encode(chunks)
+            embeddings = np.atleast_2d(embeddings).astype("float32")
+
+            # ✅ Check dimensions
+            print(f"Embeddings shape: {embeddings.shape}, FAISS expects dimension: {faiss_index.d}")
+            if embeddings.shape[1] != faiss_index.d:
+                raise ValueError(f"Embedding dimension {embeddings.shape[1]} does not match FAISS index dimension {faiss_index.d}")
+
+            faiss_index.add(embeddings)
+            chunk_text_map.extend(chunks)
+            save_embeddings_and_chunks(file_id, embeddings, chunks)
+            st.success(f"✅ Processed and saved: {filename}")
+        else:
+            with open(os.path.join(EMBEDDING_DIR, f"{file_id}_chunks.json")) as f:
+                chunks = json.load(f)
+            chunk_text_map.extend(chunks)
+            st.info(f"✅ Embeddings for {filename} already loaded.")
+
+
+question = st.text_input("❓ Ask something about the PDF:")
+
+if question:
+    with st.spinner("Thinking locally with Ollama..."):
+        try:
+            top_chunks = search_faiss_top_chunks(question)
+            answer = answer_with_ollama_chunks(top_chunks, question)
+            st.markdown("### 🔍 Top Relevant Chunks:")
+            for i, chunk in enumerate(top_chunks):
+                st.markdown(f"**Chunk {i+1}:** {chunk[:300]}...")
+            st.markdown(f"**🧠 Answer:** {answer}")
+        except Exception as e:
+            st.error(f"⚠️ Ollama Error: {e}")
